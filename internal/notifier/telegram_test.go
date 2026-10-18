@@ -97,3 +97,68 @@ func TestTelegramRejectsBadTemplate(t *testing.T) {
 		t.Fatal("expected error for malformed template, got nil")
 	}
 }
+
+func TestTelegramDefaultMessageShowsKeyForPublickey(t *testing.T) {
+	tg, err := NewTelegram(TelegramOptions{BotToken: "x", ChatID: "1"})
+	if err != nil {
+		t.Fatalf("NewTelegram: %v", err)
+	}
+	e := testEvent()
+	e.KeyAlgorithm = "ED25519"
+	e.KeyFingerprint = "SHA256:flbXq7ZJ0j1lEALPYzbOGOVUwI2Yz0Y4yYPqbPZ8ZjQ"
+	msg, err := tg.render(e)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{
+		"<b>Key:</b> <code>ED25519</code>",
+		"<b>Fingerprint:</b> <code>SHA256:flbXq7ZJ0j1lEALPYzbOGOVUwI2Yz0Y4yYPqbPZ8ZjQ</code>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message missing %q\n%s", want, msg)
+		}
+	}
+	if strings.Index(msg, "Fingerprint") > strings.Index(msg, "Time") {
+		t.Errorf("key lines should precede Time\n%s", msg)
+	}
+}
+
+func TestTelegramDefaultMessageKeyUnknown(t *testing.T) {
+	tg, _ := NewTelegram(TelegramOptions{BotToken: "x", ChatID: "1"})
+	// publickey login without key details in the log (LogLevel INFO).
+	e := testEvent()
+	msg, err := tg.render(e)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(msg, "<b>Key:</b> <code>N/A</code>") ||
+		!strings.Contains(msg, "<b>Fingerprint:</b> <code>N/A</code>") {
+		t.Errorf("expected N/A key fields\n%s", msg)
+	}
+	if strings.Contains(msg, "SHA256") {
+		t.Errorf("message must not invent a fingerprint\n%s", msg)
+	}
+}
+
+func TestTelegramDefaultMessageHidesKeyForPassword(t *testing.T) {
+	tg, _ := NewTelegram(TelegramOptions{BotToken: "x", ChatID: "1"})
+	e := testEvent()
+	e.Method = "password"
+	e.KeyAlgorithm = "ED25519"
+	e.KeyFingerprint = "SHA256:should-not-appear"
+	msg, _ := tg.render(e)
+	if strings.Contains(msg, "Key:") || strings.Contains(msg, "SHA256") {
+		t.Errorf("password login must not show key lines\n%s", msg)
+	}
+}
+
+func TestTelegramKeyFieldsAreEscaped(t *testing.T) {
+	tg, _ := NewTelegram(TelegramOptions{BotToken: "x", ChatID: "1"})
+	e := testEvent()
+	e.KeyAlgorithm = "<script>"
+	e.KeyFingerprint = "SHA256:&"
+	msg, _ := tg.render(e)
+	if strings.Contains(msg, "<script>") || !strings.Contains(msg, "&lt;script&gt;") {
+		t.Errorf("key algorithm not escaped: %s", msg)
+	}
+}

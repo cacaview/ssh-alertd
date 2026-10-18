@@ -14,12 +14,25 @@ import (
 // acceptedRE matches the sshd "Accepted" line emitted on a successful login,
 // regardless of any leading syslog timestamp/host/pid prefix. The captured
 // "from <ip> port <port>" describe the remote (client) endpoint, so the port is
-// the client's source port, not the server's listening port. Examples:
+// the client's source port, not the server's listening port. Example:
 //
-//	Accepted publickey for alice from 203.0.113.5 port 50568 ssh2: ED25519 ...
-//	Jun 26 09:49:01 host sshd[123]: Accepted password for bob from 10.0.0.2 port 41122 ssh2
+//	Accepted password for bob from 10.0.0.2 port 41122 ssh2
+//
+// Public-key logins append the key details when sshd runs with
+// LogLevel VERBOSE or higher:
+//
+//	Accepted publickey for alice from 203.0.113.5 port 50568 ssh2: ED25519 SHA256:...
 var acceptedRE = regexp.MustCompile(
 	`Accepted (\S+) for (?:invalid user )?(\S+) from (\S+) port (\d+)`,
+)
+
+// publickeyRE matches the key details at the end of an accepted public-key
+// line. Anything after "ssh2:" may be appended by sshd ("... [preauth]") or by
+// the journal/syslog, and is ignored: only the text immediately after the
+// prefix is parsed. A line without these details (LogLevel INFO) does not match
+// and the key fields stay unknown.
+var publickeyRE = regexp.MustCompile(
+	` ssh2: ([A-Za-z0-9@._+-]+) (SHA256:[A-Za-z0-9+/=_-]+)`,
 )
 
 // Handler consumes parsed login events.
@@ -75,12 +88,21 @@ func (m *Monitor) parse(line string) (event.LoginEvent, bool) {
 	if match == nil {
 		return event.LoginEvent{}, false
 	}
-	return event.LoginEvent{
+	e := event.LoginEvent{
 		Method:   match[1],
 		Username: match[2],
 		IP:       match[3],
 		Port:     match[4],
 		Hostname: m.hostname,
 		Time:     m.now(),
-	}, true
+	}
+	// Only a publickey login can carry key details, and only the server's own
+	// report is trusted; there is no fallback to local key files.
+	if e.Method == "publickey" {
+		if key := publickeyRE.FindStringSubmatch(line); key != nil {
+			e.KeyAlgorithm = key[1]
+			e.KeyFingerprint = key[2]
+		}
+	}
+	return e, true
 }

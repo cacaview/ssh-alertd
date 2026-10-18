@@ -12,6 +12,9 @@ every **successful** SSH login, sends an alert containing:
 - **Time**
 - **Client port** (the client's source port, taken from the sshd log line
   `from <IP> port <port>` — not the server's listening port 22)
+- For key logins, the **public-key algorithm** and **SHA256 fingerprint**
+  (`ED25519 SHA256:…`), when sshd logs them (see
+  [Key fingerprints](#key-fingerprints))
 
 Telegram and SMTP are implemented today. The notifier layer is an interface, so
 WhatsApp, WeCom, DingTalk and Feishu can be added as self-contained files
@@ -233,8 +236,16 @@ Templates receive the login event with these fields:
 | `.IP` | `203.0.113.5` |
 | `.Port` | `50568` (client source port) |
 | `.Method` | `publickey` / `password` |
+| `.KeyAlgorithm` | `ED25519`, `RSA`, …; `N/A` when unknown |
+| `.KeyFingerprint` | `SHA256:flbXq…`; `N/A` when unknown |
 | `.Hostname` | `web-01` |
 | `.Time` | a `time.Time`; format with `{{.Time.Format "2006-01-02 15:04:05"}}` |
+
+Telegram `message_template`s receive the same fields, plus the helper methods
+`.Algorithm` and `.Fingerprint`, which render `N/A` instead of an empty string.
+`.KeyAlgorithm` / `.KeyFingerprint` are filled only for `publickey` logins; the
+built-in messages show a `Key:` and `Fingerprint:` line for those and omit them
+for password logins.
 
 ```json
 "smtp": {
@@ -260,6 +271,33 @@ clear error rather than silently dropping alerts.
 
 Ready-to-use HTML and plain-text examples live in
 [`examples/email/`](examples/email/).
+
+### Key fingerprints
+
+For public-key logins, sshd logs the key details on the `Accepted` line:
+
+```
+Accepted publickey for alice from 203.0.113.5 port 50568 ssh2: ED25519 SHA256:VgMvONxNh...
+```
+
+ssh-alertd reads the algorithm and fingerprint from that line. It never reads
+`authorized_keys` or `known_hosts` and never guesses: when the line has no key
+details the alert shows `N/A`, which is how you can tell "key login without
+details in the log" apart from a password login.
+
+Whether the details appear depends on sshd's `LogLevel`. If your alerts show
+`N/A` for key logins, raise it in `/etc/ssh/sshd_config` and reload sshd:
+
+```ini
+LogLevel VERBOSE
+```
+
+```sh
+sudo sshd -t && sudo systemctl reload sshd
+```
+
+This adds the fingerprint (never the key itself or the private key) to the
+authentication log, so consider who can read that log.
 
 ## Run
 

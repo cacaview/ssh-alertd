@@ -67,17 +67,19 @@ func (d *Dispatcher) Dispatch(ctx context.Context, e event.LoginEvent) {
 }
 
 // plainBody is a shared, format-agnostic rendering of an event that simple
-// backends can reuse.
+// backends can reuse. Key lines appear only for publickey logins.
 func plainBody(e event.LoginEvent) string {
-	return fmt.Sprintf(
+	body := fmt.Sprintf(
 		"🔐 SSH Login Alert\n"+
 			"Host:         %s\n"+
 			"User:         %s\n"+
 			"From IP:      %s\n"+
 			"Client Port:  %s\n"+
-			"Method:       %s\n"+
-			"Time:         %s",
+			"Method:       %s",
 		e.Hostname, e.Username, e.IP, e.Port, e.Method,
-		e.Time.Format("2006-01-02 15:04:05 MST"),
 	)
+	if e.Method == "publickey" {
+		body += fmt.Sprintf("\nKey:          %s\nFingerprint:  %s", e.Algorithm(), e.Fingerprint())
+	}
+	return body + fmt.Sprintf("\nTime:         %s", e.Time.Format("2006-01-02 15:04:05 MST"))
 }
