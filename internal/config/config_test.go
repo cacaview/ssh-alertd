@@ -330,3 +330,44 @@ export EXPORTED=x=y
 		t.Error("expected error for a line without =")
 	}
 }
+
+// A variable that is absent from the process environment (o.Getenv is nil, as
+// when LoadWithOptions is called without Options) must still come from the env
+// file, or systemd EnvironmentFile= credentials would be ignored.
+func TestEnvFileAppliedWhenGetenvNil(t *testing.T) {
+	clearEnv(t, "")
+	path := writeFile(t, "config.json", minimalJSON)
+	envFile := writeFile(t, "ssh-alertd.env", "SSH_ALERTD_SMTP_PASSWORD=from-file\n")
+
+	cfg, err := LoadWithOptions(path, Options{EnvFile: envFile})
+	if err != nil {
+		t.Fatalf("LoadWithOptions: %v", err)
+	}
+	if got := cfg.Notifiers.SMTP.Password; got != "from-file" {
+		t.Fatalf("password = %q, want from-file", got)
+	}
+}
+
+// The injected lookup must be consulted before the env file, the same order as
+// the real process environment.
+func TestInjectedGetenvBeforeEnvFile(t *testing.T) {
+	clearEnv(t, "")
+	path := writeFile(t, "config.json", minimalJSON)
+	envFile := writeFile(t, "ssh-alertd.env",
+		"SSH_ALERTD_SMTP_PASSWORD=from-file\nSSH_ALERTD_SMTP_HOST=file-host\n")
+	env := map[string]string{"SSH_ALERTD_SMTP_PASSWORD": "from-getenv"}
+
+	cfg, err := LoadWithOptions(path, Options{
+		EnvFile: envFile,
+		Getenv:  func(k string) string { return env[k] },
+	})
+	if err != nil {
+		t.Fatalf("LoadWithOptions: %v", err)
+	}
+	if cfg.Notifiers.SMTP.Password != "from-getenv" {
+		t.Errorf("password = %q, want from-getenv", cfg.Notifiers.SMTP.Password)
+	}
+	if cfg.Notifiers.SMTP.Host != "file-host" {
+		t.Errorf("host = %q, want file-host", cfg.Notifiers.SMTP.Host)
+	}
+}
