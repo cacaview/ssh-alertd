@@ -229,8 +229,10 @@ func (s *SMTP) message(e event.LoginEvent) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("render subject: %w", err)
 	}
-	// A subject is a single header line.
-	subject = strings.TrimSpace(strings.ReplaceAll(subject, "\n", " "))
+	// A subject is a single header line: strip every control character (a CR or
+	// LF from an event value such as a username would otherwise start a new
+	// header) and fold the whitespace left behind.
+	subject = singleLine(subject)
 
 	body, err := s.renderBody(e)
 	if err != nil {
@@ -244,9 +246,9 @@ func (s *SMTP) message(e event.LoginEvent) (string, error) {
 
 	headers := []string{
 		"Date: " + e.Time.Format(time.RFC1123Z),
-		"From: " + s.from,
-		"To: " + strings.Join(s.to, ", "),
-		"Subject: " + mime.QEncoding.Encode("utf-8", subject),
+		"From: " + headerValue(s.from),
+		"To: " + headerValue(strings.Join(s.to, ", ")),
+		"Subject: " + encodeHeader(subject),
 		"MIME-Version: 1.0",
 		"Content-Type: " + contentType,
 		"Content-Transfer-Encoding: 8bit",
@@ -256,4 +258,53 @@ func (s *SMTP) message(e event.LoginEvent) (string, error) {
 	body = strings.ReplaceAll(body, "\r\n", "\n")
 	body = strings.ReplaceAll(body, "\n", "\r\n")
 	return strings.Join(headers, "\r\n") + "\r\n\r\n" + body + "\r\n", nil
+}
+
+// headerValue makes a configured address header safe on one line. Addresses
+// come from the config file, which an administrator controls, but a stray
+// newline in one must not be able to add headers to the message.
+func headerValue(s string) string {
+	return singleLine(s)
+}
+
+// singleLine removes control characters (including CR/LF from a rendered
+// field) and collapses the runs of whitespace that leaves behind.
+func singleLine(s string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		switch r {
+		case '\r', '\n', '\t', '\v', '\f':
+			return ' '
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	return strings.Join(strings.Fields(cleaned), " ")
+}
+
+// encodeHeader MIME word-encodes a header value only when it is not plain
+// ASCII, or when encoding is not lossless. Q-encoding cannot carry arbitrary
+// bytes faithfully, so a template file with invalid UTF-8 is sent as a
+// sanitized raw header instead of failing the alert.
+func encodeHeader(s string) string {
+	if isPlainHeader(s) {
+		return s
+	}
+	decoded, err := new(mime.WordDecoder).DecodeHeader(mime.QEncoding.Encode("utf-8", s))
+	if err != nil || decoded != s {
+		return singleLine(strings.ToValidUTF8(s, "?"))
+	}
+	return mime.QEncoding.Encode("utf-8", s)
+}
+
+// isPlainHeader reports whether s is printable ASCII and therefore needs no
+// MIME encoding.
+func isPlainHeader(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }

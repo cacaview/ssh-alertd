@@ -254,6 +254,10 @@ Templates receive the login event with these fields:
   over `body_template` and is handy for multi-line or HTML bodies.
 - `html: true` renders the body as `text/html` (using `html/template`, which
   auto-escapes the event fields); pair it with a `body_template`.
+- The subject is always a single header line: control characters are stripped
+  and folded to spaces, so a value containing a newline cannot add mail headers
+  (e.g. a `Bcc:`). Non-ASCII subjects are MIME-encoded; a template file with
+  invalid UTF-8 is sanitized instead of failing the alert.
 
 Templates are compiled at startup, so a malformed template fails fast with a
 clear error rather than silently dropping alerts.
