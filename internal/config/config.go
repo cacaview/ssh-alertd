@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 )
 
 // Config is the root configuration object.
@@ -100,6 +102,52 @@ type SMTPConfig struct {
 	// HTML renders the body as text/html (using html/template for auto-escaping)
 	// instead of text/plain. Pair it with a BodyTemplate.
 	HTML bool `json:"html"`
+
+	// RetryAttempts is the total number of delivery attempts per alert,
+	// including the first; 0 or 1 sends once. Only connecting, the greeting and
+	// the DATA command are retried — authentication, sender and recipient
+	// rejections, and anything after the body was accepted are not.
+	RetryAttempts int `json:"retry_attempts"`
+	// RetryDelay is the first backoff before a retry, doubled on each further
+	// attempt. 0 means 1s.
+	RetryDelay Duration `json:"retry_delay"`
+	// RetryMaxDelay caps the backoff. 0 means 5s.
+	RetryMaxDelay Duration `json:"retry_max_delay"`
+}
+
+// Duration is a time.Duration in JSON. It accepts a string such as "2s" or
+// "500ms", or a number of seconds.
+type Duration time.Duration
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	text := strings.TrimSpace(string(b))
+	if text == "null" {
+		return nil
+	}
+	if strings.HasPrefix(text, `"`) {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		parsed, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("invalid duration %q (want e.g. \"2s\")", s)
+		}
+		*d = Duration(parsed)
+		return nil
+	}
+	var seconds float64
+	if err := json.Unmarshal(b, &seconds); err != nil {
+		return fmt.Errorf("invalid duration %s (want a string like \"2s\" or seconds)", text)
+	}
+	*d = Duration(seconds * float64(time.Second))
+	return nil
+}
+
+// MarshalJSON implements json.Marshaler.
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
 }
 
 // Load reads, parses and validates the config file at path.
@@ -152,6 +200,12 @@ func (c *Config) applyDefaults() {
 			smtp.Port = 587
 		}
 	}
+	if smtp.RetryAttempts > 0 && smtp.RetryDelay == 0 {
+		smtp.RetryDelay = Duration(time.Second)
+	}
+	if smtp.RetryAttempts > 0 && smtp.RetryMaxDelay == 0 {
+		smtp.RetryMaxDelay = Duration(5 * time.Second)
+	}
 }
 
 func (c *Config) validate() error {
@@ -183,6 +237,12 @@ func (c *Config) validate() error {
 		case "starttls", "tls", "none":
 		default:
 			return fmt.Errorf("smtp enabled but encryption %q is invalid (want starttls, tls or none)", s.Encryption)
+		}
+		if s.RetryAttempts < 0 {
+			return fmt.Errorf("smtp retry_attempts must not be negative")
+		}
+		if s.RetryDelay < 0 || s.RetryMaxDelay < 0 {
+			return fmt.Errorf("smtp retry_delay and retry_max_delay must not be negative")
 		}
 		if s.Host == "" {
 			return fmt.Errorf("smtp enabled but host is empty")

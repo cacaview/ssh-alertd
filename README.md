@@ -217,6 +217,18 @@ server directly.
 - `username` / `password`: optional; omit `username` to skip authentication
   (e.g. an internal relay). When set, `PLAIN` auth is used (so always over TLS).
 - `to`: one or more recipients; at least one is required.
+- `retry_attempts`: total delivery attempts per alert, including the first;
+  `0`/`1` (default) sends once. Only **connecting**, the SMTP greeting, and the
+  `DATA` command are retried — a temporary rejection (4xx) there is retried with
+  exponential backoff. Authentication, sender (`MAIL FROM`) and recipient
+  (`RCPT TO`) rejections are never retried, and neither is anything after the
+  server has taken the message body: at that point the alert may already be
+  queued, so it is reported as an error instead of risking a duplicate.
+- `retry_delay` / `retry_max_delay`: first backoff (default `1s`, doubled on each
+  retry) and its cap (default `5s`). Durations accept `"500ms"` / `"2s"` or a
+  number of seconds. The dispatcher cancels a delivery after 10 seconds, so
+  the attempts and backoffs should fit in that budget (`3` attempts with the
+  default backoff take at most ~13s of retries plus delivery time; prefer `2`).
 - Multiple notifiers can be enabled at once — each enabled backend gets every
   alert independently.
 

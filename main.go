@@ -116,6 +116,10 @@ func buildNotifiers(cfg *config.Config, logger *log.Logger) ([]notifier.Notifier
 			SubjectTemplate: s.SubjectTemplate,
 			BodyTemplate:    body,
 			HTML:            s.HTML,
+			RetryAttempts:   s.RetryAttempts,
+			RetryDelay:      time.Duration(s.RetryDelay),
+			RetryMaxDelay:   time.Duration(s.RetryMaxDelay),
+			Logf:            logger.Printf,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("smtp: %w", err)
