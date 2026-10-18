@@ -175,18 +175,23 @@ func (t *Telegram) Send(ctx context.Context, e event.LoginEvent) error {
 }
 
 // defaultTelegramHTML renders the built-in Telegram HTML message. User-controlled
-// fields are escaped to avoid breaking the markup or injecting tags.
+// fields are escaped to avoid breaking the markup or injecting tags. The key
+// lines are omitted for non-publickey logins and show N/A when sshd did not log
+// the key details.
 func defaultTelegramHTML(e event.LoginEvent) string {
 	esc := html.EscapeString
-	return fmt.Sprintf(
+	msg := fmt.Sprintf(
 		"🔐 <b>SSH Login Alert</b>\n\n"+
 			"<b>Host:</b> <code>%s</code>\n"+
 			"<b>User:</b> <code>%s</code>\n"+
 			"<b>From IP:</b> <code>%s</code>\n"+
 			"<b>Client Port:</b> <code>%s</code>\n"+
-			"<b>Method:</b> <code>%s</code>\n"+
-			"<b>Time:</b> <code>%s</code>",
+			"<b>Method:</b> <code>%s</code>",
 		esc(e.Hostname), esc(e.Username), esc(e.IP), esc(e.Port), esc(e.Method),
-		esc(e.Time.Format("2006-01-02 15:04:05 MST")),
 	)
+	if e.Method == "publickey" {
+		msg += fmt.Sprintf("\n<b>Key:</b> <code>%s</code>\n<b>Fingerprint:</b> <code>%s</code>",
+			esc(e.Algorithm()), esc(e.Fingerprint()))
+	}
+	return msg + fmt.Sprintf("\n<b>Time:</b> <code>%s</code>", esc(e.Time.Format("2006-01-02 15:04:05 MST")))
 }
