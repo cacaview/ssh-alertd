@@ -205,7 +205,7 @@ func LoadWithOptions(path string, o Options) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := cfg.applyEnv(env, o.Getenv); err != nil {
+	if err := cfg.applyEnv(env, getenv); err != nil {
 		return nil, err
 	}
 
@@ -278,20 +278,22 @@ func parseEnvFile(data string) (map[string]string, error) {
 	return vars, nil
 }
 
-// lookupEnv returns name from the real process environment first, then the env
-// file. A set-but-empty variable counts as a value, so SSH_ALERTD_SMTP_PASSWORD=
-// deliberately clears a password that came from JSON.
+// lookupEnv returns name from the environment first (the real process
+// environment, then the injected lookup), then the env file. A set-but-empty
+// variable counts as a value, so SSH_ALERTD_SMTP_PASSWORD= deliberately clears
+// a password that came from JSON. File values therefore never mask an override
+// supplied through the process environment.
 func lookupEnv(name string, file map[string]string, getenv func(string) string) (string, bool) {
 	if v, ok := os.LookupEnv(name); ok {
-		return v, true
-	}
-	if v, ok := file[name]; ok {
 		return v, true
 	}
 	if getenv != nil {
 		if v := getenv(name); v != "" {
 			return v, true
 		}
+	}
+	if v, ok := file[name]; ok {
+		return v, true
 	}
 	return "", false
 }
