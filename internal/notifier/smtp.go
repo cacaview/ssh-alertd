@@ -403,8 +403,11 @@ func (s *SMTP) message(e event.LoginEvent) (string, error) {
 		"Content-Transfer-Encoding: 8bit",
 	}
 
-	// Normalise body line endings to CRLF.
+	// Normalise body line endings to CRLF. RFC 5322 requires it, and unlike
+	// headers, the net/smtp DotWriter does not convert bare newlines in the
+	// body itself.
 	body = strings.ReplaceAll(body, "\r\n", "\n")
+	body = strings.ReplaceAll(body, "\r", "\n")
 	body = strings.ReplaceAll(body, "\n", "\r\n")
 	return strings.Join(headers, "\r\n") + "\r\n\r\n" + body + "\r\n", nil
 }

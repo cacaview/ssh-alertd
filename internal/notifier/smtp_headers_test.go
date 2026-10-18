@@ -128,3 +128,20 @@ func TestSingleLine(t *testing.T) {
 		}
 	}
 }
+
+func TestBodyLineEndingsAreCRLF(t *testing.T) {
+	s := mustSMTP(t, SMTPOptions{Port: 25, Encryption: "none", BodyTemplate: "a\rb\r\nc\nd"})
+	msg, err := s.message(testEvent())
+	if err != nil {
+		t.Fatalf("message: %v", err)
+	}
+	body := msg[strings.Index(msg, "\r\n\r\n")+4:]
+	if want := "a\r\nb\r\nc\r\nd\r\n"; body != want {
+		t.Fatalf("body = %q, want %q", body, want)
+	}
+	// No bare CR or LF may survive anywhere in the message.
+	if strings.Contains(strings.ReplaceAll(msg, "\r\n", ""), "\r") ||
+		strings.Contains(strings.ReplaceAll(strings.ReplaceAll(msg, "\r\n", ""), "\r", ""), "\n") {
+		t.Fatalf("message has a bare CR or LF:\n%q", msg)
+	}
+}
