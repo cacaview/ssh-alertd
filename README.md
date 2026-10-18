@@ -233,8 +233,16 @@ Templates receive the login event with these fields:
 | `.IP` | `203.0.113.5` |
 | `.Port` | `50568` (client source port) |
 | `.Method` | `publickey` / `password` |
+| `.KeyAlgorithm` | `ED25519`, `RSA`, …; `N/A` when unknown |
+| `.KeyFingerprint` | `SHA256:flbXq…`; `N/A` when unknown |
 | `.Hostname` | `web-01` |
 | `.Time` | a `time.Time`; format with `{{.Time.Format "2006-01-02 15:04:05"}}` |
+
+Telegram `message_template`s receive the same fields, plus the helper methods
+`.Algorithm` and `.Fingerprint`, which render `N/A` instead of an empty string.
+`.KeyAlgorithm` / `.KeyFingerprint` are filled only for `publickey` logins; the
+built-in messages show a `Key:` and `Fingerprint:` line for those and omit them
+for password logins.
 
 ```json
 "smtp": {

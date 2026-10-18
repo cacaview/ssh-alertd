@@ -12,6 +12,8 @@
 - **時間**
 - **用戶端連接埠**（用戶端的來源連接埠，取自 sshd 日誌行中的
   `from <IP> port <port>`，而非伺服器監聽的 22 埠）
+- 對於金鑰登入，在 sshd 記錄了這些資訊時，包含**公開金鑰演算法**與 **SHA256 指紋**
+  （`ED25519 SHA256:…`，見下文[金鑰指紋](#金鑰指紋)）
 
 目前已實作 Telegram 與 SMTP。通知後端層是一個介面，因此 WhatsApp、
 企業微信、釘釘與飛書都能以獨立、自成一體的檔案新增，
@@ -23,7 +25,7 @@
 main.go                       wiring: config -> source -> monitor -> dispatcher
 internal/
   event/event.go              LoginEvent domain model
-  config/config.go            JSON config loading + validation
+  config/config.go            JSON 設定 + SSH_ALERTD_* 環境變數覆寫、驗證
   monitor/
     source.go                 Source interface; journald & file followers
     monitor.go                sshd line parser -> LoginEvent
@@ -91,6 +93,40 @@ Telegram bot token 與 chat ID。
   `file`（透過 `tail -F` 跟隨 `log_source.path`，例如 Debian/Ubuntu 上的
   `/var/log/auth.log` 或 RHEL 上的 `/var/log/secure`）。
 - `hostname`：選用的覆寫值；預設使用作業系統的主機名稱。
+
+### 環境變數（選用）
+
+認證資訊可以放在 `config.json` 之外，透過 `SSH_ALERTD_*` 環境變數提供。優先順序為
+**內建預設值 < JSON 檔案 < 環境變數**，因此現有設定不需任何修改即可繼續運作。
+
+```sh
+sudo install -m0600 ssh-alertd.env.example /etc/ssh-alertd/ssh-alertd.env
+sudo systemctl restart ssh-alertd      # unit 透過 EnvironmentFile= 讀取它
+```
+
+| 變數 | 覆寫的設定項 |
+| --- | --- |
+| `SSH_ALERTD_HOSTNAME` | `hostname` |
+| `SSH_ALERTD_LOG_SOURCE_TYPE`、`SSH_ALERTD_LOG_SOURCE_PATH` | `log_source.type` / `.path` |
+| `SSH_ALERTD_TELEGRAM_ENABLED`、`_BOT_TOKEN`、`_CHAT_ID`、`_API_BASE`、`_PARSE_MODE` | 對應的 `telegram.*` |
+| `SSH_ALERTD_TELEGRAM_MESSAGE_TEMPLATE`、`_MESSAGE_TEMPLATE_FILE` | `telegram.message_template` / `.message_template_file` |
+| `SSH_ALERTD_SMTP_ENABLED`、`_HOST`、`_PORT`、`_USERNAME`、`_PASSWORD`、`_FROM`、`_TO`、`_ENCRYPTION` | 對應的 `smtp.*` |
+| `SSH_ALERTD_SMTP_SUBJECT_TEMPLATE`、`_BODY_TEMPLATE`、`_BODY_TEMPLATE_FILE`、`_HTML` | 對應的 `smtp.*` |
+| `SSH_ALERTD_SMTP_RETRY_ATTEMPTS`、`_RETRY_DELAY`、`_RETRY_MAX_DELAY` | 對應的 `smtp.*` |
+
+- 變數名稱就是 `SSH_ALERTD_` 加上大寫的 JSON 鍵（`SMTP_` / `TELEGRAM_` 前綴代表
+  JSON 中的設定區塊），因此重試參數也能用環境變數調整（`SMTP_RETRY_DELAY`
+  接受 `500ms` 這類 Go duration）。
+- 布林值接受 `true`/`false`/`1`/`0`；`SMTP_PORT` 必須是整數。非法值會以指出
+  變數名稱的錯誤中止啟動，且錯誤訊息不會回顯該值。
+- `SSH_ALERTD_SMTP_TO` 是以**分號或空白**分隔的清單。逗號會被刻意拒絕：它在
+  `"Doe, John <j@example.com>"` 這類顯示名稱中是合法的。
+- 空值也算「已設定」，因此 `SSH_ALERTD_SMTP_PASSWORD=` 會清除 JSON 中的密碼。
+- 檔案為 dotenv 格式（`KEY=VALUE`、`#` 註解、引號可選、不做 shell 展開）。
+  讀取順序為 `-env-file`、`$SSH_ALERTD_ENV_FILE`、以及存在時的
+  `/etc/ssh-alertd/ssh-alertd.env`。明示指定的檔案必須存在，拼字錯誤會報錯而
+  不是被默默忽略。
+- JSON 檔案始終必要——環境變數只覆寫取值，不會取代該檔案。
 
 ### Telegram Bot 設定
 
@@ -204,7 +240,15 @@ curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage" \
 - `port`：選用——`tls` 預設為 `465`，否則為 `587`。
 - `username` / `password`：選用；省略 `username` 即可略過驗證
   （例如內部中繼）。當有設定時，會使用 `PLAIN` 驗證（因此務必透過 TLS 進行）。
-- `to`：一個或多個收件者；至少需要一個。
+- `retry_attempts`：每則警示的總投遞次數（含首次）；`0`/`1`（預設）表示只傳送
+  一次。只有**建立連線**、SMTP 問候與 `DATA` 命令會被重試——這些環節的暫時性
+  拒絕（4xx）會以指數退避重試。驗證、寄件人（`MAIL FROM`）與收件人（`RCPT TO`）
+  被拒絕時從不重試；伺服器接收內文之後的任何失敗也不重試，因為此時警示可能已經
+  排入佇列，程式會回報錯誤而不是冒重複投遞的風險。
+- `retry_delay` / `retry_max_delay`：首次退避（預設 `1s`，每次重試加倍）及其上限
+  （預設 `5s`）。時長可寫成 `"500ms"` / `"2s"` 或秒數。調度器會在 10 秒後取消
+  一次投遞，因此嘗試次數與退避應控制在該預算內（預設退避下 3 次嘗試意味著最多
+  約 13 秒的重試時間，建議使用 `2`）。
 - 可以同時啟用多個通知後端——每個已啟用的後端都會獨立收到每一則警示。
 
 Telegram 與 SMTP 彼此獨立：啟用其中一個並不需要另一個。
@@ -220,8 +264,15 @@ Telegram 與 SMTP 彼此獨立：啟用其中一個並不需要另一個。
 | `.IP` | `203.0.113.5` |
 | `.Port` | `50568`（用戶端的來源連接埠） |
 | `.Method` | `publickey` / `password` |
+| `.KeyAlgorithm` | `ED25519`、`RSA` 等；未知時為 `N/A` |
+| `.KeyFingerprint` | `SHA256:flbXq…`；未知時為 `N/A` |
 | `.Hostname` | `web-01` |
-| `.Time` | 一個 `time.Time`；可用 `{{.Time.Format "2006-01-02 15:04:05"}}` 格式化 |
+| `.Time` | 一個 `time.Time`；用 `{{.Time.Format "2006-01-02 15:04:05"}}` 格式化 |
+
+Telegram 的 `message_template` 同樣可以使用這些欄位，另外還有 `.Algorithm` 與
+`.Fingerprint` 方法（缺省時輸出 `N/A` 而不是空字串）。`.KeyAlgorithm` /
+`.KeyFingerprint` 僅在 `publickey` 登入時填入；內建訊息在此時顯示 `Key:` 與
+`Fingerprint:` 兩行，密碼登入時不顯示。
 
 ```json
 "smtp": {
@@ -238,10 +289,38 @@ Telegram 與 SMTP 彼此獨立：啟用其中一個並不需要另一個。
 - `subject_template` / `body_template`：行內 Go 範本。留空則使用內建的主旨與內文。
 - `body_template_file`：作為內文範本讀取的檔案路徑；它的優先順序高於 `body_template`，適合用於多行或 HTML 內文。
 - `html: true` 會將內文以 `text/html` 呈現（使用 `html/template`，它會自動跳脫事件欄位）；請搭配 `body_template` 一起使用。
+- 主旨始終是單行郵件標頭：控制字元會被移除並摺疊為空格，因此含有換行的值無法
+  新增郵件標頭（例如 `Bcc:`）。非 ASCII 主旨會進行 MIME 編碼；包含非法 UTF-8 的
+  範本檔案會被清洗，而不是導致警示傳送失敗。
 
 範本會在啟動時編譯，因此格式錯誤的範本會立即以清楚的錯誤訊息失敗，而不會默默地遺漏警示。
 
 可直接使用的 HTML 與純文字範例位於 [`examples/email/`](../examples/email/)。
+
+### 金鑰指紋
+
+對於公開金鑰登入，sshd 會在 `Accepted` 行中記錄金鑰資訊：
+
+```
+Accepted publickey for alice from 203.0.113.5 port 50568 ssh2: ED25519 SHA256:VgMvONxNh...
+```
+
+ssh-alertd 只從這一行讀取演算法與指紋，不會讀取 `authorized_keys` 或 `known_hosts`，
+也不會猜測：當日誌行中沒有金鑰資訊時，警示會顯示 `N/A`，藉此可區分「日誌中沒有
+詳細資訊的金鑰登入」與密碼登入。
+
+是否記錄這些資訊取決於 sshd 的 `LogLevel`。如果金鑰登入的警示顯示 `N/A`，請在
+`/etc/ssh/sshd_config` 提高日誌等級並重新載入 sshd：
+
+```ini
+LogLevel VERBOSE
+```
+
+```sh
+sudo sshd -t && sudo systemctl reload sshd
+```
+
+這會把指紋（不是公鑰本身，更不是私鑰）寫入認證日誌，請留意哪些人能夠讀取該日誌。
 
 ## 執行
 
