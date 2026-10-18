@@ -1,4 +1,9 @@
-// Package config loads and validates the daemon configuration from a JSON file.
+// Package config loads and validates the daemon configuration from a JSON file,
+// optionally overridden by SSH_ALERTD_* environment variables.
+//
+// Precedence, lowest to highest: built-in defaults < JSON file < environment.
+// The file is always required; environment variables only override individual
+// settings, which keeps credentials (bot token, SMTP password) out of the file.
 package config
 
 import (
@@ -6,7 +11,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 )
+
+// EnvPrefix is prepended to every environment variable that overrides config.
+// See EnvVars for the supported names.
+const EnvPrefix = "SSH_ALERTD_"
+
+// DefaultEnvFile is read when it exists and no env file was named explicitly.
+// It holds the same SSH_ALERTD_* names as the process environment.
+const DefaultEnvFile = "/etc/ssh-alertd/ssh-alertd.env"
 
 // Config is the root configuration object.
 type Config struct {
@@ -102,8 +117,31 @@ type SMTPConfig struct {
 	HTML bool `json:"html"`
 }
 
+// Options controls how the configuration is loaded.
+type Options struct {
+	// EnvFile is an optional path to a KEY=VALUE file. When empty, the file
+	// named by SSH_ALERTD_ENV_FILE is read if set. Missing files are an error
+	// when the path is explicit; the implicit default is only read when it
+	// exists. Variables already present in the environment always win.
+	EnvFile string
+	// Getenv looks up an environment variable; nil means os.Getenv.
+	Getenv func(string) string
+}
+
 // Load reads, parses and validates the config file at path.
 func Load(path string) (*Config, error) {
+	return LoadWithOptions(path, Options{})
+}
+
+// LoadWithOptions is Load plus environment support: it applies the optional
+// env file and then the SSH_ALERTD_* variable overrides before defaults and
+// validation run, so an overridden value is validated like any other.
+func LoadWithOptions(path string, o Options) (*Config, error) {
+	getenv := o.Getenv
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -116,11 +154,195 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
+	env, err := loadEnvFile(o.EnvFile, getenv)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.applyEnv(env, o.Getenv); err != nil {
+		return nil, err
+	}
+
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// loadEnvFile resolves the KEY=VALUE file to read. A path given as an option or
+// in SSH_ALERTD_ENV_FILE must exist; the conventional DefaultEnvFile is
+// optional so installations that do not use one keep working.
+func loadEnvFile(path string, getenv func(string) string) (map[string]string, error) {
+	explicit := path != ""
+	if !explicit {
+		if _, ok := os.LookupEnv(EnvPrefix + "ENV_FILE"); ok {
+			path, explicit = os.Getenv(EnvPrefix+"ENV_FILE"), true
+		} else if v := getenv(EnvPrefix + "ENV_FILE"); v != "" {
+			path, explicit = v, true
+		}
+	}
+	if path == "" {
+		path = DefaultEnvFile
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !explicit && os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read env file %s: %w", path, err)
+	}
+	vars, err := parseEnvFile(string(data))
+	if err != nil {
+		return nil, fmt.Errorf("parse env file %s: %w", path, err)
+	}
+	return vars, nil
+}
+
+// parseEnvFile parses dotenv-style content: one KEY=VALUE per line, blank
+// lines and # comments ignored, an optional "export " prefix, and single or
+// double quotes around the value (double quotes understand \n and \\). Unlike
+// a shell it never expands variables or executes anything.
+func parseEnvFile(data string) (map[string]string, error) {
+	vars := make(map[string]string)
+	for i, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, val, ok := strings.Cut(line, "=")
+		key = strings.TrimSpace(key)
+		if !ok || key == "" {
+			return nil, fmt.Errorf("line %d: want KEY=VALUE", i+1)
+		}
+		val = strings.TrimSpace(val)
+		if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') && val[len(val)-1] == val[0] {
+			inner := val[1 : len(val)-1]
+			if val[0] == '"' {
+				inner = strings.NewReplacer(`\n`, "\n", `\\`, `\`).Replace(inner)
+			}
+			val = inner
+		} else if k := strings.Index(val, " #"); k >= 0 {
+			val = strings.TrimSpace(val[:k])
+		}
+		vars[key] = val
+	}
+	return vars, nil
+}
+
+// lookupEnv returns name from the real process environment first, then the env
+// file. A set-but-empty variable counts as a value, so SSH_ALERTD_SMTP_PASSWORD=
+// deliberately clears a password that came from JSON.
+func lookupEnv(name string, file map[string]string, getenv func(string) string) (string, bool) {
+	if v, ok := os.LookupEnv(name); ok {
+		return v, true
+	}
+	if v, ok := file[name]; ok {
+		return v, true
+	}
+	if getenv != nil {
+		if v := getenv(name); v != "" {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// applyEnv overrides fields from SSH_ALERTD_* variables. Only the first error
+// is reported; values are validated afterwards, so the messages here stay
+// about parsing and never include variable values (they may hold secrets).
+func (c *Config) applyEnv(file map[string]string, getenv func(string) string) error {
+	var err error
+	str := func(dst *string, name string) {
+		if v, ok := lookupEnv(name, file, getenv); ok && err == nil {
+			*dst = v
+		}
+	}
+	boolean := func(dst *bool, name string) {
+		v, ok := lookupEnv(name, file, getenv)
+		if !ok || err != nil {
+			return
+		}
+		b, perr := strconv.ParseBool(strings.TrimSpace(v))
+		if perr != nil {
+			err = fmt.Errorf("%s: invalid boolean", name)
+			return
+		}
+		*dst = b
+	}
+	integer := func(dst *int, name string) {
+		v, ok := lookupEnv(name, file, getenv)
+		if !ok || err != nil {
+			return
+		}
+		n, perr := strconv.Atoi(strings.TrimSpace(v))
+		if perr != nil {
+			err = fmt.Errorf("%s: invalid integer", name)
+			return
+		}
+		*dst = n
+	}
+
+	str(&c.Hostname, EnvPrefix+"HOSTNAME")
+	str((*string)(&c.LogSource.Type), EnvPrefix+"LOG_SOURCE_TYPE")
+	str(&c.LogSource.Path, EnvPrefix+"LOG_SOURCE_PATH")
+
+	boolean(&c.Notifiers.Telegram.Enabled, EnvPrefix+"TELEGRAM_ENABLED")
+	str(&c.Notifiers.Telegram.BotToken, EnvPrefix+"TELEGRAM_BOT_TOKEN")
+	str(&c.Notifiers.Telegram.ChatID, EnvPrefix+"TELEGRAM_CHAT_ID")
+	str(&c.Notifiers.Telegram.APIBase, EnvPrefix+"TELEGRAM_API_BASE")
+	str(&c.Notifiers.Telegram.MessageTemplate, EnvPrefix+"TELEGRAM_MESSAGE_TEMPLATE")
+	str(&c.Notifiers.Telegram.MessageTemplateFile, EnvPrefix+"TELEGRAM_MESSAGE_TEMPLATE_FILE")
+	str(&c.Notifiers.Telegram.ParseMode, EnvPrefix+"TELEGRAM_PARSE_MODE")
+
+	boolean(&c.Notifiers.SMTP.Enabled, EnvPrefix+"SMTP_ENABLED")
+	str(&c.Notifiers.SMTP.Host, EnvPrefix+"SMTP_HOST")
+	integer(&c.Notifiers.SMTP.Port, EnvPrefix+"SMTP_PORT")
+	str(&c.Notifiers.SMTP.Username, EnvPrefix+"SMTP_USERNAME")
+	str(&c.Notifiers.SMTP.Password, EnvPrefix+"SMTP_PASSWORD")
+	str(&c.Notifiers.SMTP.From, EnvPrefix+"SMTP_FROM")
+	str(&c.Notifiers.SMTP.Encryption, EnvPrefix+"SMTP_ENCRYPTION")
+	str(&c.Notifiers.SMTP.SubjectTemplate, EnvPrefix+"SMTP_SUBJECT_TEMPLATE")
+	str(&c.Notifiers.SMTP.BodyTemplate, EnvPrefix+"SMTP_BODY_TEMPLATE")
+	str(&c.Notifiers.SMTP.BodyTemplateFile, EnvPrefix+"SMTP_BODY_TEMPLATE_FILE")
+	boolean(&c.Notifiers.SMTP.HTML, EnvPrefix+"SMTP_HTML")
+
+	// The list has no single-value syntax that can express "clear", so a
+	// separator other than a comma is used: SMTP_TO=a@x,b@y is a single
+	// address, SMTP_TO="a@x;b@y" or "a@x b@y" is a list.
+	if v, ok := lookupEnv(EnvPrefix+"SMTP_TO", file, getenv); ok && err == nil {
+		to, perr := splitList(v)
+		if perr != nil {
+			err = fmt.Errorf("%s: invalid address list", EnvPrefix+"SMTP_TO")
+		} else {
+			c.Notifiers.SMTP.To = to
+		}
+	}
+
+	return err
+}
+
+// splitList splits recipients on ";" or whitespace, never on "," — a comma is
+// valid inside a display name such as "Doe, John <j@x>" and must not silently
+// turn one recipient into two.
+func splitList(v string) ([]string, error) {
+	if strings.Contains(v, ",") && !strings.ContainsAny(v, "; \t") {
+		return nil, fmt.Errorf("comma is not a list separator")
+	}
+	fields := strings.FieldsFunc(v, func(r rune) bool {
+		return r == ';' || r == ' ' || r == '\t' || r == '\n'
+	})
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty list")
+	}
+	return out, nil
 }
 
 func (c *Config) applyDefaults() {
@@ -195,4 +417,19 @@ func (c *Config) validate() error {
 		}
 	}
 	return nil
+}
+
+// Redacted returns a copy with credentials replaced by a placeholder, for
+// logging a configuration without leaking the bot token or SMTP password. An
+// empty secret stays empty so "not configured" is still visible.
+func (c Config) Redacted() Config {
+	mask := func(s string) string {
+		if s == "" {
+			return ""
+		}
+		return "***"
+	}
+	c.Notifiers.Telegram.BotToken = mask(c.Notifiers.Telegram.BotToken)
+	c.Notifiers.SMTP.Password = mask(c.Notifiers.SMTP.Password)
+	return c
 }
