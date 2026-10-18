@@ -33,3 +33,7 @@ packaging/debian/build/
 *~
 .DS_Store
 Thumbs.db
+
+# Host-local credentials file (SSH_ALERTD_* variables)
+/ssh-alertd.env
+/etc/ssh-alertd/ssh-alertd.env

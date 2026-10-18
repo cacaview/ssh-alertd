@@ -19,11 +19,12 @@ import (
 
 func main() {
 	configPath := flag.String("config", "/etc/ssh-alertd/config.json", "path to the JSON config file")
+	envFile := flag.String("env-file", "", "path to a KEY=VALUE file whose SSH_ALERTD_* variables override the config (default: $SSH_ALERTD_ENV_FILE, else "+config.DefaultEnvFile+" if present)")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "ssh-alertd ", log.LstdFlags|log.Lmsgprefix)
 
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.LoadWithOptions(*configPath, config.Options{EnvFile: *envFile})
 	if err != nil {
 		logger.Fatalf("config: %v", err)
 	}

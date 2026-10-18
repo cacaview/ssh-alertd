@@ -6,6 +6,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/ssh-alertd -config /etc/ssh-alertd/config.json
+# Optional KEY=VALUE file with SSH_ALERTD_* overrides (e.g. the bot token or
+# SMTP password). The leading "-" makes it optional, so installations that keep
+# everything in config.json are unaffected.
+EnvironmentFile=-/etc/ssh-alertd/ssh-alertd.env
 Restart=on-failure
 RestartSec=5
 

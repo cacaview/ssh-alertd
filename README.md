@@ -23,7 +23,7 @@ without touching the rest of the system.
 main.go                       wiring: config -> source -> monitor -> dispatcher
 internal/
   event/event.go              LoginEvent domain model
-  config/config.go            JSON config loading + validation
+  config/config.go            JSON config + SSH_ALERTD_* env overrides, validation
   monitor/
     source.go                 Source interface; journald & file followers
     monitor.go                sshd line parser -> LoginEvent
@@ -94,6 +94,43 @@ Telegram bot token and chat ID.
   `file` (tails `log_source.path` via `tail -F`, e.g. `/var/log/auth.log` on
   Debian/Ubuntu or `/var/log/secure` on RHEL).
 - `hostname`: optional override; defaults to the OS hostname.
+
+### Environment variables (optional)
+
+Credentials can live outside `config.json` in `SSH_ALERTD_*` environment
+variables. Precedence is **built-in defaults < JSON file < environment**, so
+every existing configuration keeps working unchanged.
+
+```sh
+sudo install -m0600 ssh-alertd.env.example /etc/ssh-alertd/ssh-alertd.env
+sudo systemctl restart ssh-alertd      # the unit reads it via EnvironmentFile=
+```
+
+| Variable | Overrides |
+| --- | --- |
+| `SSH_ALERTD_HOSTNAME` | `hostname` |
+| `SSH_ALERTD_LOG_SOURCE_TYPE`, `SSH_ALERTD_LOG_SOURCE_PATH` | `log_source.type` / `.path` |
+| `SSH_ALERTD_TELEGRAM_ENABLED`, `_BOT_TOKEN`, `_CHAT_ID`, `_API_BASE`, `_PARSE_MODE` | the matching `telegram.*` keys |
+| `SSH_ALERTD_TELEGRAM_MESSAGE_TEMPLATE`, `_MESSAGE_TEMPLATE_FILE` | `telegram.message_template` / `.message_template_file` |
+| `SSH_ALERTD_SMTP_ENABLED`, `_HOST`, `_PORT`, `_USERNAME`, `_PASSWORD`, `_FROM`, `_TO`, `_ENCRYPTION` | the matching `smtp.*` keys |
+| `SSH_ALERTD_SMTP_SUBJECT_TEMPLATE`, `_BODY_TEMPLATE`, `_BODY_TEMPLATE_FILE`, `_HTML` | the matching `smtp.*` keys |
+
+- The variable names are literally `SSH_ALERTD_` followed by the JSON key in
+  upper case (the `SMTP_`/`TELEGRAM_` prefix stands in for the JSON block).
+- Booleans accept `true`/`false`/`1`/`0`; `SMTP_PORT` must be an integer.
+  Invalid values abort startup with a message naming the variable, and the
+  error never echoes the value.
+- `SSH_ALERTD_SMTP_TO` is a **semicolon- or space-separated** list. A comma is
+  rejected on purpose: it is legal inside a display name such as
+  `"Doe, John <j@example.com>"`.
+- An empty value still counts as set, so `SSH_ALERTD_SMTP_PASSWORD=` clears a
+  password that was in JSON.
+- The file is `dotenv`-style (`KEY=VALUE`, `#` comments, optional quotes, no
+  shell expansion). It is read from `-env-file`, else `$SSH_ALERTD_ENV_FILE`,
+  else `/etc/ssh-alertd/ssh-alertd.env` when that file exists. A file named
+  explicitly must exist; a typo is an error rather than a silent fallback.
+- The JSON file is always required — environment variables override values,
+  they do not replace the file.
 
 ### Telegram Bot setup
 
