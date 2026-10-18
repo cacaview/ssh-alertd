@@ -10,6 +10,8 @@
 - 登录**用户名**
 - **时间**
 - **客户端端口**（客户端的来源端口，取自 sshd 日志行 `from <IP> port <port>`——而非服务器的监听端口 22）
+- 对密钥登录，在 sshd 记录了这些信息时，包含**公钥算法**与 **SHA256 指纹**
+  （`ED25519 SHA256:…`，见下文[密钥指纹](#密钥指纹)）
 
 目前已实现 Telegram 和 SMTP。通知后端层是一个接口，因此 WhatsApp、企业微信、钉钉和飞书都可以作为自包含的文件添加进来，而无需改动系统的其余部分。
 
@@ -19,7 +21,7 @@
 main.go                       wiring: config -> source -> monitor -> dispatcher
 internal/
   event/event.go              LoginEvent domain model
-  config/config.go            JSON config loading + validation
+  config/config.go            JSON 配置 + SSH_ALERTD_* 环境变量覆盖、校验
   monitor/
     source.go                 Source interface; journald & file followers
     monitor.go                sshd line parser -> LoginEvent
@@ -81,6 +83,40 @@ git tag -a v0.1.3 -m "v0.1.3" && git push --follow-tags
 
 - `log_source.type`：`journald`（默认，通过 `journalctl -f` 读取 sshd）或 `file`（通过 `tail -F` 跟踪 `log_source.path`，例如 Debian/Ubuntu 上的 `/var/log/auth.log` 或 RHEL 上的 `/var/log/secure`）。
 - `hostname`：可选的覆盖项；默认使用操作系统主机名。
+
+### 环境变量（可选）
+
+凭据可以放在 `config.json` 之外，通过 `SSH_ALERTD_*` 环境变量提供。优先级为
+**内置默认值 < JSON 文件 < 环境变量**，因此现有配置无需任何修改即可继续工作。
+
+```sh
+sudo install -m0600 ssh-alertd.env.example /etc/ssh-alertd/ssh-alertd.env
+sudo systemctl restart ssh-alertd      # unit 通过 EnvironmentFile= 读取它
+```
+
+| 变量 | 覆盖的配置项 |
+| --- | --- |
+| `SSH_ALERTD_HOSTNAME` | `hostname` |
+| `SSH_ALERTD_LOG_SOURCE_TYPE`、`SSH_ALERTD_LOG_SOURCE_PATH` | `log_source.type` / `.path` |
+| `SSH_ALERTD_TELEGRAM_ENABLED`、`_BOT_TOKEN`、`_CHAT_ID`、`_API_BASE`、`_PARSE_MODE` | 对应的 `telegram.*` |
+| `SSH_ALERTD_TELEGRAM_MESSAGE_TEMPLATE`、`_MESSAGE_TEMPLATE_FILE` | `telegram.message_template` / `.message_template_file` |
+| `SSH_ALERTD_SMTP_ENABLED`、`_HOST`、`_PORT`、`_USERNAME`、`_PASSWORD`、`_FROM`、`_TO`、`_ENCRYPTION` | 对应的 `smtp.*` |
+| `SSH_ALERTD_SMTP_SUBJECT_TEMPLATE`、`_BODY_TEMPLATE`、`_BODY_TEMPLATE_FILE`、`_HTML` | 对应的 `smtp.*` |
+| `SSH_ALERTD_SMTP_RETRY_ATTEMPTS`、`_RETRY_DELAY`、`_RETRY_MAX_DELAY` | 对应的 `smtp.*` |
+
+- 变量名就是 `SSH_ALERTD_` 加上大写的 JSON 键（`SMTP_` / `TELEGRAM_` 前缀代表
+  JSON 中的配置块），因此重试参数也可以通过环境变量调整（`SMTP_RETRY_DELAY`
+  接受 `500ms` 这类 Go duration）。
+- 布尔值接受 `true`/`false`/`1`/`0`；`SMTP_PORT` 必须是整数。非法值会以指明
+  变量名的错误中止启动，且错误信息不会回显该值。
+- `SSH_ALERTD_SMTP_TO` 是以**分号或空格**分隔的列表。逗号会被有意拒绝：它在
+  `"Doe, John <j@example.com>"` 这类显示名中是合法的。
+- 空值也算“已设置”，因此 `SSH_ALERTD_SMTP_PASSWORD=` 会清除 JSON 中的密码。
+- 文件为 dotenv 格式（`KEY=VALUE`、`#` 注释、可选引号、不做 shell 展开）。
+  读取顺序为 `-env-file`、`$SSH_ALERTD_ENV_FILE`、以及存在时的
+  `/etc/ssh-alertd/ssh-alertd.env`。显式指定的文件必须存在，拼写错误会报错而
+  不是被静默忽略。
+- JSON 文件始终必需——环境变量只覆盖取值，不会替代该文件。
 
 ### Telegram Bot 配置
 
@@ -177,7 +213,15 @@ curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage" \
 - `encryption`：`starttls`（默认，通常使用 `port` `587`）、`tls`（隐式 TLS / SMTPS，通常使用 `port` `465`）或 `none`（`port` 25，无传输层安全）。
 - `port`：可选——对于 `tls` 默认为 `465`，否则为 `587`。
 - `username` / `password`：可选；省略 `username` 可跳过认证（例如内部中继）。设置后将使用 `PLAIN` 认证（因此务必通过 TLS）。
-- `to`：一个或多个收件人；至少需要一个。
+- `retry_attempts`：每条告警的总投递次数（含首次）；`0`/`1`（默认）表示只发送
+  一次。只有**建立连接**、SMTP 问候和 `DATA` 命令会被重试——这些环节的临时拒绝
+  （4xx）会以指数退避重试。认证、发件人（`MAIL FROM`）和收件人（`RCPT TO`）被
+  拒绝时从不重试；服务器接收正文之后的任何失败也不重试，因为此时告警可能已经
+  入队，程序会报告错误而不是冒重复投递的风险。
+- `retry_delay` / `retry_max_delay`：首次退避（默认 `1s`，每次重试翻倍）及其上限
+  （默认 `5s`）。时长可写作 `"500ms"` / `"2s"` 或秒数。调度器会在 10 秒后取消
+  一次投递，因此尝试次数与退避应控制在该预算内（默认退避下 3 次尝试意味着最多
+  约 13 秒的重试时间，建议使用 `2`）。
 - 可以同时启用多个通知后端——每个已启用的后端都会独立地收到每一条告警。
 
 Telegram 和 SMTP 相互独立：启用其中一个并不要求启用另一个。
@@ -193,8 +237,15 @@ Telegram 和 SMTP 相互独立：启用其中一个并不要求启用另一个�
 | `.IP` | `203.0.113.5` |
 | `.Port` | `50568`（客户端来源端口） |
 | `.Method` | `publickey` / `password` |
+| `.KeyAlgorithm` | `ED25519`、`RSA` 等；未知时为 `N/A` |
+| `.KeyFingerprint` | `SHA256:flbXq…`；未知时为 `N/A` |
 | `.Hostname` | `web-01` |
 | `.Time` | 一个 `time.Time`；用 `{{.Time.Format "2006-01-02 15:04:05"}}` 格式化 |
+
+Telegram 的 `message_template` 同样可以使用这些字段，另外还有 `.Algorithm` 与
+`.Fingerprint` 方法（缺省时输出 `N/A` 而不是空字符串）。`.KeyAlgorithm` /
+`.KeyFingerprint` 仅在 `publickey` 登录时填写；内置消息在此时显示 `Key:` 与
+`Fingerprint:` 两行，密码登录时不显示。
 
 ```json
 "smtp": {
@@ -211,10 +262,38 @@ Telegram 和 SMTP 相互独立：启用其中一个并不要求启用另一个�
 - `subject_template` / `body_template`：内联的 Go 模板。留空则使用内置的主题和正文。
 - `body_template_file`：作为正文模板读取的文件路径；它的优先级高于 `body_template`，便于编写多行或 HTML 正文。
 - `html: true` 会将正文渲染为 `text/html`（使用 `html/template`，它会自动转义事件字段）；请与 `body_template` 搭配使用。
+- 主题始终是单行邮件头：控制字符会被去除并折叠为空格，因此含有换行的值无法
+  添加邮件头（例如 `Bcc:`）。非 ASCII 主题会进行 MIME 编码；包含非法 UTF-8 的
+  模板文件会被清洗，而不是导致告警发送失败。
 
 模板在启动时编译，因此格式错误的模板会立即以清晰的错误信息失败，而不会悄无声息地丢弃告警。
 
 开箱即用的 HTML 和纯文本示例位于 [`examples/email/`](../examples/email/)。
+
+### 密钥指纹
+
+对于公钥登录，sshd 会在 `Accepted` 行中记录密钥信息：
+
+```
+Accepted publickey for alice from 203.0.113.5 port 50568 ssh2: ED25519 SHA256:VgMvONxNh...
+```
+
+ssh-alertd 只从这一行读取算法与指纹，不会读取 `authorized_keys` 或 `known_hosts`，
+也不会猜测：当日志行中没有密钥信息时，告警显示 `N/A`，据此可以区分“日志中没有
+详细信息的密钥登录”和密码登录。
+
+是否记录这些信息取决于 sshd 的 `LogLevel`。如果密钥登录的告警显示 `N/A`，请在
+`/etc/ssh/sshd_config` 中提高日志级别并重新加载 sshd：
+
+```ini
+LogLevel VERBOSE
+```
+
+```sh
+sudo sshd -t && sudo systemctl reload sshd
+```
+
+这会把指纹（不是公钥本身，更不是私钥）写入认证日志，请留意哪些人能够读取该日志。
 
 ## 运行
 

@@ -11,6 +11,8 @@ Go で書かれた、小規模でモジュール化された SSH アラートデ
 - **時刻**
 - **クライアントポート**（クライアントの送信元ポート。sshd のログ行
   `from <IP> port <port>` から取得したもので、サーバーが待ち受けるポート 22 ではありません）
+- 鍵ログインでは、sshd が記録している場合に**公開鍵アルゴリズム**と **SHA256 フィンガープリント**
+  （`ED25519 SHA256:…`）を含みます（[鍵フィンガープリント](#鍵フィンガープリント)を参照）
 
 現在は Telegram と SMTP が実装されています。通知層はインターフェースになっているため、WhatsApp、
 WeCom、DingTalk、Feishu を、システムの他の部分に手を加えることなく
@@ -22,7 +24,7 @@ WeCom、DingTalk、Feishu を、システムの他の部分に手を加えるこ
 main.go                       wiring: config -> source -> monitor -> dispatcher
 internal/
   event/event.go              LoginEvent domain model
-  config/config.go            JSON config loading + validation
+  config/config.go            JSON 設定 + SSH_ALERTD_* 環境変数による上書き、検証
   monitor/
     source.go                 Source interface; journald & file followers
     monitor.go                sshd line parser -> LoginEvent
@@ -90,6 +92,43 @@ Telegram のボットトークンとチャット ID を記入します。
   `file`（`tail -F` 経由で `log_source.path` を追従する。例: Debian/Ubuntu では `/var/log/auth.log`、
   RHEL では `/var/log/secure`）。
 - `hostname`: 任意の上書き指定。デフォルトは OS のホスト名です。
+
+### 環境変数（任意）
+
+認証情報は `config.json` の外、`SSH_ALERTD_*` 環境変数に置くこともできます。
+優先順位は **組み込みの既定値 < JSON ファイル < 環境変数** なので、既存の
+設定はそのまま動作します。
+
+```sh
+sudo install -m0600 ssh-alertd.env.example /etc/ssh-alertd/ssh-alertd.env
+sudo systemctl restart ssh-alertd      # unit が EnvironmentFile= で読み込みます
+```
+
+| 変数 | 上書きする項目 |
+| --- | --- |
+| `SSH_ALERTD_HOSTNAME` | `hostname` |
+| `SSH_ALERTD_LOG_SOURCE_TYPE`, `SSH_ALERTD_LOG_SOURCE_PATH` | `log_source.type` / `.path` |
+| `SSH_ALERTD_TELEGRAM_ENABLED`, `_BOT_TOKEN`, `_CHAT_ID`, `_API_BASE`, `_PARSE_MODE` | 対応する `telegram.*` |
+| `SSH_ALERTD_TELEGRAM_MESSAGE_TEMPLATE`, `_MESSAGE_TEMPLATE_FILE` | `telegram.message_template` / `.message_template_file` |
+| `SSH_ALERTD_SMTP_ENABLED`, `_HOST`, `_PORT`, `_USERNAME`, `_PASSWORD`, `_FROM`, `_TO`, `_ENCRYPTION` | 対応する `smtp.*` |
+| `SSH_ALERTD_SMTP_SUBJECT_TEMPLATE`, `_BODY_TEMPLATE`, `_BODY_TEMPLATE_FILE`, `_HTML` | 対応する `smtp.*` |
+| `SSH_ALERTD_SMTP_RETRY_ATTEMPTS`, `_RETRY_DELAY`, `_RETRY_MAX_DELAY` | 対応する `smtp.*` |
+
+- 変数名は `SSH_ALERTD_` に JSON キーを大文字にしたものを続けた形です（`SMTP_` /
+  `TELEGRAM_` は JSON のブロックを表します）。再試行の設定も環境変数で調整でき
+  ます（`SMTP_RETRY_DELAY` は `500ms` のような Go の duration）。
+- 真偽値は `true`/`false`/`1`/`0`、`SMTP_PORT` は整数です。不正な値では変数名を
+  含むメッセージで起動に失敗し、値そのものは表示されません。
+- `SSH_ALERTD_SMTP_TO` は**セミコロンまたは空白**区切りのリストです。カンマは
+  意図的に拒否します（`"Doe, John <j@example.com>"` のような表示名に使われるため）。
+- 空値も「設定済み」として扱うので、`SSH_ALERTD_SMTP_PASSWORD=` とすると JSON
+  のパスワードを消去できます。
+- ファイルは dotenv 形式です（`KEY=VALUE`、`#` コメント、引用符は任意、シェル
+  展開なし）。`-env-file`、`$SSH_ALERTD_ENV_FILE`、存在すれば
+  `/etc/ssh-alertd/ssh-alertd.env` の順に読みます。明示したファイルが無い場合は
+  エラーです（タイプミスを黙って無視しません）。
+- JSON ファイル自体は常に必要です。環境変数は値を上書きするだけで、ファイルを
+  置き換えるものではありません。
 
 ### Telegram Bot のセットアップ
 
@@ -202,7 +241,17 @@ curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage" \
 - `port`: 任意。`tls` の場合は `465`、それ以外の場合は `587` がデフォルトです。
 - `username` / `password`: 任意。`username` を省略すると認証をスキップします
   （例: 内部リレー）。設定した場合は `PLAIN` 認証が使われます（そのため必ず TLS 上で行ってください）。
-- `to`: 1 つ以上の宛先。少なくとも 1 つが必要です。
+- `retry_attempts`: 1 件のアラートあたりの総送信試行回数（初回を含む）。
+  `0`/`1`（デフォルト）は 1 回だけ送信します。再試行するのは**接続**、SMTP の
+  あいさつ、`DATA` コマンドだけです（そこでの一時的な拒否（4xx）を指数バック
+  オフで再試行します）。認証、`MAIL FROM`、`RCPT TO` の拒否は再試行しません。
+  また、サーバーが本文を受け取った後の失敗も再試行しません。その時点でアラート
+  は既にキューに入っている可能性があるため、重複を避けてエラーとして報告します。
+- `retry_delay` / `retry_max_delay`: 最初のバックオフ（デフォルト `1s`、再試行
+  ごとに倍）とその上限（デフォルト `5s`）。期間は `"500ms"` / `"2s"` または秒数
+  で指定します。ディスパッチャーは送信を 10 秒で打ち切るため、試行とバックオフ
+  はその範囲に収めてください（3 回の試行で既定のバックオフを使うと再試行だけで
+  最大約 13 秒かかるため、`2` を推奨します）。
 - 複数の通知バックエンドを同時に有効化できます。有効な各バックエンドは、すべての
   アラートを独立して受け取ります。
 
@@ -219,8 +268,16 @@ Telegram と SMTP は独立しています。一方を有効にしても、も�
 | `.IP` | `203.0.113.5` |
 | `.Port` | `50568`（クライアントの送信元ポート） |
 | `.Method` | `publickey` / `password` |
+| `.KeyAlgorithm` | `ED25519`、`RSA` など。不明な場合は `N/A` |
+| `.KeyFingerprint` | `SHA256:flbXq…`。不明な場合は `N/A` |
 | `.Hostname` | `web-01` |
 | `.Time` | `time.Time`。`{{.Time.Format "2006-01-02 15:04:05"}}` で書式化します |
+
+Telegram の `message_template` でも同じフィールドが使え、さらに `.Algorithm` と
+`.Fingerprint` メソッド（空文字の代わりに `N/A` を返す）も利用できます。
+`.KeyAlgorithm` / `.KeyFingerprint` は `publickey` ログインでのみ設定され、組み込みの
+メッセージはその場合に `Key:` と `Fingerprint:` の行を表示し、パスワードログインでは
+表示しません。
 
 ```json
 "smtp": {
@@ -237,10 +294,42 @@ Telegram と SMTP は独立しています。一方を有効にしても、も�
 - `subject_template` / `body_template`: インラインの Go テンプレート。空の値の場合は、組み込みの件名と本文が使われます。
 - `body_template_file`: 本文テンプレートとして読み込まれるパス。`body_template` より優先され、複数行や HTML の本文に便利です。
 - `html: true` は本文を `text/html` としてレンダリングします（`html/template` を使い、イベントフィールドを自動エスケープします）。`body_template` と組み合わせて使ってください。
+- 件名は常に 1 行のヘッダーです。制御文字は除去され空白に畳み込まれるため、
+  改行を含む値がメールヘッダー（`Bcc:` など）を追加することはできません。
+  非 ASCII の件名は MIME エンコードされ、無効な UTF-8 を含むテンプレート
+  ファイルはアラートを失敗させずにサニタイズされます。
 
 テンプレートは起動時にコンパイルされるため、不正なテンプレートはアラートを黙って取りこぼすのではなく、明確なエラーで即座に失敗します。
 
 すぐに使える HTML およびプレーンテキストの例は [`examples/email/`](../examples/email/) にあります。
+
+### 鍵フィンガープリント
+
+公開鍵ログインでは、sshd が `Accepted` 行に鍵の詳細を記録します。
+
+```
+Accepted publickey for alice from 203.0.113.5 port 50568 ssh2: ED25519 SHA256:VgMvONxNh...
+```
+
+ssh-alertd はこの行からアルゴリズムとフィンガープリントを読み取ります。
+`authorized_keys` や `known_hosts` は読まず、推測もしません。行に鍵の詳細が無い
+場合、通知には `N/A` が表示されます。これにより「ログに詳細が無い鍵ログイン」と
+パスワードログインを区別できます。
+
+詳細が記録されるかどうかは sshd の `LogLevel` に依存します。鍵ログインで `N/A`
+と表示される場合は、`/etc/ssh/sshd_config` で次のように上げて sshd を再読み込み
+してください。
+
+```ini
+LogLevel VERBOSE
+```
+
+```sh
+sudo sshd -t && sudo systemctl reload sshd
+```
+
+これによりフィンガープリント（鍵そのものや秘密鍵ではありません）が認証ログに
+記録されるため、そのログを誰が読めるかに注意してください。
 
 ## 実行
 
